@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Smart Energy Optimizer — Fixed (Login + LSTM Forecast)</title>
+
+<!-- Chart.js -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels"></script>
+
+<!-- TensorFlow.js -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.9.0/dist/tf.min.js"></script>
+
+<style>
+/* ---------------- global ---------------- */
+body{font-family:Inter, Poppins, system-ui; background:#071022; color:#fff; margin:0; height:100vh;}
+
+/* ---------------- LOGIN ---------------- */
+#loginContainer{
+  height:100vh; display:flex; justify-content:center; align-items:center; background:#020617;
+}
+#loginBox{ background:#0f172a; padding:28px; width:340px; border-radius:12px; box-shadow:0 6px 24px rgba(0,0,0,0.6); }
+#loginBox h2{ margin:0 0 12px 0; text-align:center; }
+.loginInput{ width:100%; margin-bottom:12px; padding:10px; border:none; border-radius:6px; background:#101827; color:#fff; }
+#loginBtn{ width:100%; padding:10px; background:#10b981; border:none; color:#042617; font-weight:700; border-radius:6px; cursor:pointer; }
+#loginError{ color:#ff6b6b; text-align:center; margin-top:8px; display:none; }
+
+/* ---------------- DASHBOARD ---------------- */
+#dashboard{ display:none; height:100vh; }
+
+/* layout */
+#left{ width:65%; padding:20px; float:left; box-sizing:border-box; }
+#right{ width:35%; padding:20px; float:right; box-sizing:border-box; background:#081226; overflow:auto; height:100vh; }
+
+/* small components */
+.card{ background:linear-gradient(180deg, rgba(255,255,255,0.01), rgba(255,255,255,0.005)); padding:14px; border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,0.6); margin-bottom:12px; }
+.header{ display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
+.btn{ padding:8px 12px; border-radius:8px; border:none; cursor:pointer; font-weight:600; }
+.btn-primary{ background:#10b981; color:#061217; }
+.btn-ghost{ background:transparent; border:1px solid rgba(255,255,255,0.04); color:#94a3b8; }
+.small{ font-size:13px; color:#94a3b8; }
+#loading{ position:fixed; left:0; top:0; right:0; bottom:0; background:rgba(2,6,23,0.6); display:none; align-items:center; justify-content:center; z-index:9999; font-size:18px; }
+
+/* forecast legend */
+.legend{ font-size:13px; color:#94a3b8; margin-bottom:6px; }
+
+/* misc */
+#log div{ padding:6px; border-bottom:1px dashed rgba(255,255,255,0.03); }
+</style>
+</head>
+<body>
+
+<!-- LOGIN -->
+<div id="loginContainer">
+  <div id="loginBox">
+    <h2>Sign in</h2>
+    <input id="username" class="loginInput" placeholder="Username" autocomplete="username" />
+    <input id="password" class="loginInput" type="password" placeholder="Password" autocomplete="current-password" />
+    <button id="loginBtn">Login</button>
+    <div id="loginError">Invalid username or password</div>
+    <p style="margin-top:12px; font-size:13px; color:#94a3b8; text-align:center;">Demo credentials: <strong>admin</strong> / <strong>1234</strong></p>
+  </div>
+</div>
+
+<!-- DASHBOARD -->
+<div id="dashboard">
+  <div id="left">
+    <div class="header">
+      <div style="font-weight:700">Smart Energy Optimizer (with LSTM Forecast)</div>
+      <div class="small">Local Demo — LSTM runs in your browser</div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 8px 0">Power Usage (kW)</h3>
+      <canvas id="powerChart" style="height:320px"></canvas>
+      <div style="display:flex;justify-content:space-between;margin-top:10px">
+        <div>
+          <button id="startSim" class="btn btn-primary">Start Simulation</button>
+          <button id="stopSim" class="btn btn-ghost">Stop</button>
+        </div>
+        <div>
+          <button id="trainLSTM" class="btn btn-ghost">Train LSTM Forecast</button>
+          <button id="retrain" class="btn btn-ghost">Retrain Regression</button>
+          <button id="exportCsv" class="btn btn-ghost">Export CSV</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="display:flex;gap:12px">
+      <div style="flex:1">
+        <h4 style="margin:0 0 8px 0">Forecast (next)</h4>
+        <div class="legend">Blue = LSTM forecast (multi-step)</div>
+        <canvas id="forecastChart" style="height:140px"></canvas>
+      </div>
+      <div style="width:230px">
+        <h4 style="margin:0 0 8px 0">Recent Log</h4>
+        <div id="log" style="max-height:200px; overflow:auto"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="right">
+    <div class="card">
+      <h3 style="margin-top:0">Live Payload</h3>
+      <p><strong>Power:</strong> <span id="powerVal">--</span> kW</p>
+      <p><strong>Temperature:</strong> <span id="tempVal">--</span> °C</p>
+      <p><strong>Occupancy:</strong> <span id="occVal">--</span></p>
+      <p><strong>Lighting:</strong> <span id="lightVal">--</span> %</p>
+      <p><strong>Energy Level:</strong> <span id="energyBadge" style="padding:8px;border-radius:8px;background:#ffd700;color:#000">MEDIUM</span></p>
+
+      <h4>Recommendations</h4>
+      <ul id="recs"></ul>
+      <p class="small" style="margin-top:10px">Notes: LSTM training uses recorded history + synthetic augmentation. Training runs in-browser — expect a few seconds.</p>
+    </div>
+  </div>
+</div>
+
+<div id="loading">⏳ Training LSTM model — please wait...</div>
+
+<script>
+/* ================== Wrapped script to ensure DOM ready & robust error handling ================== */
+document.addEventListener('DOMContentLoaded', () => {
+  try {
+    /* ================== LOGIN ================== */
+    document.getElementById('loginBtn').addEventListener('click', () => {
+      const u = document.getElementById('username').value.trim();
+      const p = document.getElementById('password').value.trim();
+      if (u === 'admin' && p === '1234') {
+        document.getElementById('loginError').style.display = 'none';
+        document.getElementById('loginContainer').style.display = 'none';
+        document.getElementById('dashboard').style.display = 'block';
+      } else {
+        document.getElementById('loginError').style.display = 'block';
+      }
+    });
+
+    /* ================== CHARTS ================== */
+    const powerCtx = document.getElementById('powerChart').getContext('2d');
+    const powerChart = new Chart(powerCtx, {
+      type: 'line',
+      data: { labels: [], datasets: [{ label: 'Power (kW)', data: [], borderColor:'#10b981', backgroundColor:'rgba(16,185,129,0.12)', fill:true, tension:0.3 }] },
+      options: { scales:{ y:{ beginAtZero:true, max:10 }}, plugins:{ legend:{display:false} } }
+    });
+    const fcCtx = document.getElementById('forecastChart').getContext('2d');
+    const forecastChart = new Chart(fcCtx, {
+      type: 'bar',
+      data: { labels: [], datasets: [{ label:'LSTM Forecast kW', data: [], backgroundColor:'rgba(59,130,246,0.9)'}] },
+      options: { scales:{ y:{ beginAtZero:true, max:10 }}, plugins:{ legend:{display:false} } }
+    });
+
+    /* ================== SIMULATION & HISTORY ================== */
+    let simInterval = null;
+    const history = []; // {ts,temp,occ,light,hvac,kW}
+
+    function generateSample(){
+      const temp = +(18 + Math.random() * 16).toFixed(1);
+      const occ = Math.floor(Math.random() * 20);
+      const light = Math.floor(Math.random() * 100);
+      const hvac = occ > 10 ? 1 : 0;
+      const kW = +(0.4 + (temp-18)*0.12 + occ*0.18 + light*0.01 + hvac*1.25 + (Math.random()-0.5)*0.25).toFixed(3);
+      return { ts: Date.now(), temp, occ, light, hvac, kW };
+    }
+
+    async function appendSample(s){
+      try {
+        history.push(s);
+
+        // update charts & UI
+        const label = new Date(s.ts).toLocaleTimeString();
+        powerChart.data.labels.push(label);
+        powerChart.data.datasets[0].data.push(s.kW);
+        if (powerChart.data.labels.length > 60) { powerChart.data.labels.shift(); powerChart.data.datasets[0].data.shift(); }
+        powerChart.update();
+
+        document.getElementById('powerVal').textContent = s.kW.toFixed(2);
+        document.getElementById('tempVal').textContent = s.temp.toFixed(1);
+        document.getElementById('occVal').textContent = s.occ;
+        document.getElementById('lightVal').textContent = s.light;
+
+        const lvl = s.kW > 5 ? 'HIGH' : s.kW > 3 ? 'MEDIUM' : 'LOW';
+        const badge = document.getElementById('energyBadge');
+        badge.textContent = lvl;
+        badge.style.background = lvl === 'HIGH' ? '#ff6b6b' : lvl === 'MEDIUM' ? '#ffd700' : '#00b894';
+
+        const recsList = document.getElementById('recs');
+        recsList.innerHTML = '';
+        const actions = lvl === 'HIGH' ? ['Reduce HVAC runtime','Delay high-load tasks','Disable non-essential loads'] : lvl === 'MEDIUM' ? ['Monitor usage','Consider dimming lights'] : ['Energy efficient','OK to run devices'];
+        actions.forEach(a => { const li = document.createElement('li'); li.textContent = a; recsList.appendChild(li); });
+
+        // log
+        const log = document.getElementById('log');
+        const el = document.createElement('div');
+        el.textContent = `${label} | ${s.kW.toFixed(2)} kW | ${lvl}`;
+        log.prepend(el);
+
+        // If LSTM is trained, produce forecast after each new sample
+        if (lstmTrained) {
+          // run but don't block UI (fire and forget)
+          runLSTMForecast(5).catch(err => {
+            console.warn('LSTM forecast error (non-fatal):', err);
+          });
+        }
+      } catch (err) {
+        console.error('Error in appendSample:', err);
+      }
+    }
+
+    // Robust event wiring — check element presence
+    const startBtn = document.getElementById('startSim');
+    const stopBtn = document.getElementById('stopSim');
+
+    startBtn.addEventListener('click', () => {
+      try {
+        if (simInterval) {
+          // already running
+          console.log('Simulation already running');
+          return;
+        }
+        // first sample immediately
+        appendSample(generateSample()).catch(e => console.error('appendSample initial error', e));
+        // subsequent samples
+        simInterval = setInterval(() => {
+          appendSample(generateSample()).catch(e => console.error('appendSample interval error', e));
+        }, 3500);
+        // visual feedback
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+      } catch (err) {
+        console.error('Error starting simulation:', err);
+        alert('Failed to start simulation (see console).');
+      }
+    });
+
+    stopBtn.addEventListener('click', () => {
+      try {
+        if (simInterval) {
+          clearInterval(simInterval);
+          simInterval = null;
+          console.log('Simulation stopped');
+        }
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+      } catch (err) {
+        console.error('Error stopping simulation:', err);
+      }
+    });
+
+    // initially stop button disabled
+    stopBtn.disabled = true;
+
+    document.getElementById('exportCsv').addEventListener('click', () => {
+      try {
+        if (history.length === 0) { alert('No history yet'); return; }
+        let csv = 'ts,temp,occ,light,hvac,kW\n';
+        history.forEach(h => csv += `${new Date(h.ts).toISOString()},${h.temp},${h.occ},${h.light},${h.hvac},${h.kW}\n`);
+        const blob = new Blob([csv], { type:'text/csv' });
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'history.csv'; a.click();
+      } catch (err) {
+        console.error('Export CSV error:', err);
+        alert('Failed to export CSV (see console).');
+      }
+    });
+
+    /* ================== REGRESSION MODEL ================== */
+    let regModel = null;
+    async function buildRegression(){
+      try {
+        if (regModel) try{ regModel.dispose(); } catch(e){}
+        regModel = tf.sequential();
+        regModel.add(tf.layers.dense({ inputShape:[4], units:24, activation:'relu' }));
+        regModel.add(tf.layers.dense({ units:12, activation:'relu' }));
+        regModel.add(tf.layers.dense({ units:1 }));
+        regModel.compile({ optimizer:'adam', loss:'meanSquaredError' });
+
+        const xs = [], ys = [];
+        for (let i=0;i<600;i++){
+          const t = 18 + Math.random()*16; const occ = Math.floor(Math.random()*20); const light = Math.floor(Math.random()*100); const hvac = occ>10?1:0;
+          const k = 0.4 + (t-18)*0.12 + occ*0.18 + light*0.01 + hvac*1.25 + (Math.random()-0.5)*0.25;
+          xs.push([t,occ,light,hvac]); ys.push([k]);
+        }
+        await regModel.fit(tf.tensor2d(xs), tf.tensor2d(ys), { epochs:25, batchSize:32, verbose:0 });
+      } catch (err) {
+        console.error('buildRegression error:', err);
+        throw err;
+      }
+    }
+
+    // Build initial regression but don't block UI
+    buildRegression().then(()=>console.log('Initial regression built')).catch(e=>console.error('Initial regression failed', e));
+
+    document.getElementById('retrain').addEventListener('click', async () => {
+      try {
+        document.getElementById('loading').style.display = 'flex';
+        document.getElementById('loading').textContent = '⏳ Retraining regression model...';
+
+        // If we have real history >= 40, use it, else synthetic fallback
+        let xs=[], ys=[];
+        if (history.length >= 40) {
+          history.forEach(h => { xs.push([h.temp, h.occ, h.light, h.hvac]); ys.push([h.kW]); });
+        } else {
+          // synthetic (same as buildRegression sample generation)
+          for (let i=0;i<600;i++){
+            const t = 18 + Math.random()*16; const occ = Math.floor(Math.random()*20); const light = Math.floor(Math.random()*100); const hvac = occ>10?1:0;
+            const k = 0.4 + (t-18)*0.12 + occ*0.18 + light*0.01 + hvac*1.25 + (Math.random()-0.5)*0.25;
+            xs.push([t,occ,light,hvac]); ys.push([k]);
+          }
+        }
+
+        // (re)create and train upgraded regression
+        if (regModel) try{ regModel.dispose(); } catch(e){}
+        regModel = tf.sequential();
+        regModel.add(tf.layers.dense({ inputShape:[4], units:48, activation:'relu' }));
+        regModel.add(tf.layers.dropout({ rate:0.2 }));
+        regModel.add(tf.layers.dense({ units:24, activation:'relu' }));
+        regModel.add(tf.layers.dense({ units:1 }));
+        regModel.compile({ optimizer: tf.train.adam(0.001), loss:'meanSquaredError' });
+
+        const xT = tf.tensor2d(xs);
+        const yT = tf.tensor2d(ys);
+        const historyFit = await regModel.fit(xT, yT, { epochs:30, validationSplit:0.15, batchSize:32, shuffle:true, verbose:0,
+          callbacks: {
+            onEpochEnd: async (epoch, logs) => {
+              // you could update a UI element with logs.loss/logs.val_loss here if desired
+              await tf.nextFrame();
+            }
+          }
+        });
+        xT.dispose(); yT.dispose();
+
+        // compute last prediction using last available sample (real or synthetic)
+        const lastSample = history.length ? history[history.length-1] : { temp: xs[xs.length-1][0], occ: xs[xs.length-1][1], light: xs[xs.length-1][2], hvac: xs[xs.length-1][3] };
+        const predT = regModel.predict(tf.tensor2d([[lastSample.temp, lastSample.occ, lastSample.light, lastSample.hvac]]));
+        const predVal = (await predT.data())[0];
+        predT.dispose();
+
+        document.getElementById('loading').style.display = 'none';
+
+        // Option A style: popup summary
+        alert(
+          "Regression Retrained Successfully!\n\n" +
+          "Training Loss (final): " + (historyFit.history.loss.length ? historyFit.history.loss[historyFit.history.loss.length-1].toFixed(6) : 'n/a') +
+          "\nValidation Loss (final): " + (historyFit.history.val_loss && historyFit.history.val_loss.length ? historyFit.history.val_loss[historyFit.history.val_loss.length-1].toFixed(6) : 'n/a') +
+          "\n\nLast Predicted kW (regression): " + predVal.toFixed(3) +
+          "\nSamples used: " + xs.length
+        );
+
+      } catch (err) {
+        console.error('Retrain regression error:', err);
+        document.getElementById('loading').style.display = 'none';
+        alert('Regression retrain failed — see console for details.');
+      }
+    });
+
+    /* ================== LSTM MODEL (SEQ FORECAST) ================== */
+    let lstmModel = null;
+    let lstmWindow = 12; // number of timesteps used as input
+    let lstmTrained = false;
+
+    function showLoading(on, text) {
+      const el = document.getElementById('loading');
+      el.style.display = on ? 'flex' : 'none';
+      if (text) el.textContent = text;
+    }
+
+    function buildLSTM(windowSize){
+      const model = tf.sequential();
+      model.add(tf.layers.lstm({ units: 64, inputShape: [windowSize, 4], returnSequences: false }));
+      model.add(tf.layers.dense({ units: 32, activation: 'relu' }));
+      model.add(tf.layers.dense({ units: 1 }));
+      model.compile({ optimizer: tf.train.adam(0.001), loss: 'meanSquaredError' });
+      return model;
+    }
+
+    function prepareSeqData(windowSize){
+      const xs = [], ys = [];
+      if (history.length <= windowSize) return { xs, ys };
+      for (let i=0; i + windowSize < history.length; i++){
+        const win = history.slice(i, i + windowSize);
+        const next = history[i + windowSize].kW;
+        const seq = [];
+        win.forEach(w => seq.push([w.temp, w.occ, w.light, w.hvac]));
+        xs.push(seq);
+        ys.push([next]);
+      }
+      // augmentation to increase samples
+      const augCount = Math.max(0, 300 - xs.length);
+      for (let a=0; a<augCount; a++){
+        const seq = [];
+        let baseT = 18 + Math.random()*16;
+        let baseOcc = Math.floor(Math.random()*20);
+        let baseLight = Math.floor(Math.random()*100);
+        for (let j=0;j<windowSize;j++){
+          const t = +(baseT + (Math.random()-0.5)*2).toFixed(2);
+          const occ = Math.max(0, Math.round(baseOcc + (Math.random()-0.5)*3));
+          const light = Math.max(0, Math.min(100, Math.round(baseLight + (Math.random()-0.5)*10)));
+          const hv = occ>10?1:0;
+          seq.push([t, occ, light, hv]);
+        }
+        const last = seq[seq.length-1];
+        const tgt = +(0.4 + (last[0]-18)*0.12 + last[1]*0.18 + last[2]*0.01 + last[3]*1.25 + (Math.random()-0.5)*0.25).toFixed(3);
+        xs.push(seq); ys.push([tgt]);
+      }
+      return { xs, ys };
+    }
+
+    document.getElementById('trainLSTM').addEventListener('click', async () => {
+      try {
+        if (history.length < lstmWindow + 2) {
+          alert(`Not enough history to train LSTM. Collect at least ${lstmWindow + 2} samples by running simulation.`);
+          return;
+        }
+        showLoading(true, '⏳ Preparing data...');
+        await tf.nextFrame();
+
+        const { xs, ys } = prepareSeqData(lstmWindow);
+        if (xs.length === 0) { showLoading(false); alert('No sequences prepared for training'); return; }
+
+        const xsTensor = tf.tensor3d(xs); // [samples, window, features]
+        const ysTensor = tf.tensor2d(ys); // [samples, 1]
+
+        lstmModel = buildLSTM(lstmWindow);
+        showLoading(true, '⏳ Training LSTM model — epoch 0');
+
+        await lstmModel.fit(xsTensor, ysTensor, {
+          epochs: 30,
+          batchSize: 24,
+          shuffle: true,
+          callbacks: {
+            onEpochBegin: async (epoch) => {
+              showLoading(true, `⏳ Training LSTM model — epoch ${epoch+1}/30`);
+              await tf.nextFrame();
+            }
+          }
+        });
+
+        xsTensor.dispose(); ysTensor.dispose();
+        lstmTrained = true;
+        showLoading(false);
+        alert('LSTM training complete — forecasts now use LSTM.');
+
+        // IMMEDIATE forecast after successful training
+        try {
+          await runLSTMForecast(5);
+        } catch(e) {
+          console.warn('Forecast after training failed:', e);
+        }
+      } catch (err) {
+        console.error('trainLSTM error:', err);
+        showLoading(false);
+        alert('LSTM training failed — see console.');
+      }
+    });
+
+    async function runLSTMForecast(steps = 5){
+      try {
+        if (!lstmTrained || !lstmModel) {
+          console.warn('LSTM is not trained yet.');
+          throw new Error('LSTM not trained');
+        }
+        if (history.length < lstmWindow) {
+          console.warn('Not enough history for forecasting.');
+          throw new Error('Not enough history');
+        }
+
+        const lastWindow = history.slice(history.length - lstmWindow).map(w => [w.temp, w.occ, w.light, w.hvac]);
+        let inputWindow = lastWindow.map(v => v.slice());
+
+        const preds = [];
+        for (let s=0; s<steps; s++){
+          const tIn = tf.tensor3d([ inputWindow ]); // shape [1, window, features]
+          const out = lstmModel.predict(tIn);
+          const predVal = (await out.data())[0];
+          preds.push(Number(predVal.toFixed(3)));
+
+          // slide window: append simulated next features
+          inputWindow.shift();
+          const lastFeat = inputWindow[inputWindow.length - 1] || lastWindow[lastWindow.length - 1];
+          const nextTemp = +(lastFeat[0] + (Math.random()-0.5)*1.2).toFixed(2);
+          const nextOcc = Math.max(0, Math.round(lastFeat[1] + Math.round((Math.random()-0.5)*3)));
+          const nextLight = Math.max(0, Math.min(100, Math.round(lastFeat[2] + Math.round((Math.random()-0.5)*8))));
+          const nextHvac = nextOcc > 10 ? 1 : 0;
+          inputWindow.push([nextTemp, nextOcc, nextLight, nextHvac]);
+
+          tIn.dispose(); out.dispose();
+        }
+
+        // Update forecast chart
+        forecastChart.data.labels = Array.from({length: steps}, (_,i)=>`t+${i+1}`);
+        forecastChart.data.datasets[0].data = preds;
+        forecastChart.update();
+      } catch (err) {
+        console.error('runLSTMForecast error:', err);
+        throw err;
+      }
+    }
+
+    /* Helper: double-click main chart title to manually run forecast if trained */
+    document.querySelector('.card h3')?.addEventListener('dblclick', ()=> {
+      if (lstmTrained) runLSTMForecast(5).catch(()=>{});
+    });
+
+    /* ================== END ================== */
+    console.log('Dashboard script initialized successfully.');
+  } catch (e) {
+    console.error('Fatal initialization error:', e);
+    alert('Initialization error - check console for details.');
+  }
+});
+</script>
+</body>
+</html>
